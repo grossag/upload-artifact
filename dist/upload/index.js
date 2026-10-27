@@ -130609,6 +130609,15 @@ async function upload_artifact_uploadArtifact(artifactName, filesToUpload, rootD
 
 
 
+
+
+
+const MANIFEST_PREFIX = '.artifact_upload_manifest.';
+const MANIFEST_SUFFIX = '.json';
+const getManifestName = (groupName) => `${MANIFEST_PREFIX}${groupName}${MANIFEST_SUFFIX}`;
+const isManifestName = (name) => name.startsWith(MANIFEST_PREFIX) &&
+    name.endsWith(MANIFEST_SUFFIX) &&
+    name.length > MANIFEST_PREFIX.length + MANIFEST_SUFFIX.length;
 async function deleteArtifactIfExists(artifactName) {
     try {
         await artifact.deleteArtifact(artifactName);
@@ -130620,6 +130629,64 @@ async function deleteArtifactIfExists(artifactName) {
         }
         // Best effort, we don't want to fail the action if this fails
         core_debug(`Unable to delete artifact: ${error.message}`);
+    }
+}
+/**
+ * Builds a flat artifact name per file by joining its path segments with `_`
+ * (e.g. `tests/folder1/a.txt` -> `tests_folder1_a.txt`). Paths are relative to
+ * the workspace when the file is inside it, otherwise to the search root.
+ * Throws if two files map to the same name.
+ */
+function getUnarchivedArtifactNames(files, rootDirectory, manifestName) {
+    const workspace = external_path_.resolve(process.env['GITHUB_WORKSPACE'] || process.cwd());
+    const owners = new Map([[manifestName, 'the manifest']]);
+    return files.map(file => {
+        let relative = external_path_.relative(workspace, file);
+        if (relative.startsWith('..') || external_path_.isAbsolute(relative)) {
+            relative = external_path_.relative(rootDirectory, file);
+        }
+        const segments = relative.split(/[\\/]+/).filter(Boolean);
+        const name = segments.join('_');
+        if (isManifestName(name)) {
+            throw new Error(`'${file}' would be uploaded as '${name}', which is reserved for upload manifests. No artifacts were uploaded.`);
+        }
+        const existing = owners.get(name);
+        if (existing !== undefined) {
+            throw new Error(`Artifact name collision: '${existing}' and '${file}' would both be uploaded as '${name}'. No artifacts were uploaded.`);
+        }
+        owners.set(name, file);
+        return { artifact: name, path: segments.join('/') };
+    });
+}
+/**
+ * Without `overwrite`, fail up front if any target name is already taken in
+ * this run so we never leave a partial set of artifacts behind. Best effort:
+ * if listing fails, the upload itself still rejects duplicates.
+ */
+async function findExistingArtifacts(names) {
+    try {
+        const { artifacts } = await artifact.listArtifacts({ latest: true });
+        const taken = new Set(artifacts.map(a => a.name));
+        return names.filter(n => taken.has(n));
+    }
+    catch (error) {
+        core_debug(`Unable to list existing artifacts: ${error.message}`);
+        return [];
+    }
+}
+/**
+ * Uploads a manifest artifact mapping each artifact name to its original
+ * relative path so download-artifact can restore the directory structure.
+ */
+async function uploadManifest(manifestName, entries, options) {
+    const dir = await promises_namespaceObject.mkdtemp(external_path_.join(process.env['RUNNER_TEMP'] || external_os_.tmpdir(), 'upload-manifest-'));
+    try {
+        const manifestFile = external_path_.join(dir, manifestName);
+        await promises_namespaceObject.writeFile(manifestFile, JSON.stringify({ version: 1, files: entries }, null, 2));
+        await upload_artifact_uploadArtifact(manifestName, [manifestFile], dir, options);
+    }
+    finally {
+        await promises_namespaceObject.rm(dir, { recursive: true, force: true });
     }
 }
 async function run() {
@@ -130646,20 +130713,50 @@ async function run() {
         const s = searchResult.filesToUpload.length === 1 ? '' : 's';
         info(`With the provided path, there will be ${searchResult.filesToUpload.length} file${s} uploaded`);
         core_debug(`Root artifact directory is ${searchResult.rootDirectory}`);
-        // Validate that only a single file is uploaded when archive is false
-        if (!inputs.archive && searchResult.filesToUpload.length > 1) {
-            setFailed(`When 'archive' is set to false, only a single file can be uploaded. Found ${searchResult.filesToUpload.length} files to upload.`);
-            return;
-        }
-        if (inputs.overwrite) {
-            await deleteArtifactIfExists(inputs.artifactName);
-        }
         const options = {};
         if (inputs.retentionDays) {
             options.retentionDays = inputs.retentionDays;
         }
         if (typeof inputs.compressionLevel !== 'undefined') {
             options.compressionLevel = inputs.compressionLevel;
+        }
+        if (!inputs.archive && searchResult.filesToUpload.length > 1) {
+            // Each file becomes its own artifact; validate all names before uploading anything
+            const manifestName = getManifestName(inputs.artifactName);
+            let entries;
+            try {
+                entries = getUnarchivedArtifactNames(searchResult.filesToUpload, searchResult.rootDirectory, manifestName);
+            }
+            catch (error) {
+                setFailed(error.message);
+                return;
+            }
+            if (!inputs.overwrite) {
+                const taken = await findExistingArtifacts([
+                    ...entries.map(e => e.artifact),
+                    manifestName
+                ]);
+                if (taken.length > 0) {
+                    setFailed(`Artifact(s) already exist in this run: ${taken.join(', ')}. No artifacts were uploaded. Set 'overwrite: true' to replace them.`);
+                    return;
+                }
+            }
+            options.skipArchive = true;
+            for (let i = 0; i < entries.length; i++) {
+                if (inputs.overwrite) {
+                    await deleteArtifactIfExists(entries[i].artifact);
+                }
+                await upload_artifact_uploadArtifact(entries[i].artifact, [searchResult.filesToUpload[i]], searchResult.rootDirectory, options);
+            }
+            // Uploaded last so its presence implies every file above succeeded
+            if (inputs.overwrite) {
+                await deleteArtifactIfExists(manifestName);
+            }
+            await uploadManifest(manifestName, entries, options);
+            return;
+        }
+        if (inputs.overwrite) {
+            await deleteArtifactIfExists(inputs.artifactName);
         }
         if (!inputs.archive) {
             options.skipArchive = true;

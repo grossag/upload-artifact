@@ -3,10 +3,29 @@ import artifact, {
   UploadArtifactOptions,
   ArtifactNotFoundError
 } from '@actions/artifact'
+import * as fs from 'fs/promises'
+import * as os from 'os'
+import * as path from 'path'
 import {findFilesToUpload} from '../shared/search.js'
 import {getInputs} from './input-helper.js'
 import {NoFileOptions} from './constants.js'
 import {uploadArtifact} from '../shared/upload-artifact.js'
+
+export const MANIFEST_PREFIX = '.artifact_upload_manifest.'
+export const MANIFEST_SUFFIX = '.json'
+
+export const getManifestName = (groupName: string): string =>
+  `${MANIFEST_PREFIX}${groupName}${MANIFEST_SUFFIX}`
+
+const isManifestName = (name: string): boolean =>
+  name.startsWith(MANIFEST_PREFIX) &&
+  name.endsWith(MANIFEST_SUFFIX) &&
+  name.length > MANIFEST_PREFIX.length + MANIFEST_SUFFIX.length
+
+export interface ManifestEntry {
+  artifact: string
+  path: string
+}
 
 async function deleteArtifactIfExists(artifactName: string): Promise<void> {
   try {
@@ -19,6 +38,86 @@ async function deleteArtifactIfExists(artifactName: string): Promise<void> {
 
     // Best effort, we don't want to fail the action if this fails
     core.debug(`Unable to delete artifact: ${(error as Error).message}`)
+  }
+}
+
+/**
+ * Builds a flat artifact name per file by joining its path segments with `_`
+ * (e.g. `tests/folder1/a.txt` -> `tests_folder1_a.txt`). Paths are relative to
+ * the workspace when the file is inside it, otherwise to the search root.
+ * Throws if two files map to the same name.
+ */
+export function getUnarchivedArtifactNames(
+  files: string[],
+  rootDirectory: string,
+  manifestName: string
+): ManifestEntry[] {
+  const workspace = path.resolve(
+    process.env['GITHUB_WORKSPACE'] || process.cwd()
+  )
+  const owners = new Map<string, string>([[manifestName, 'the manifest']])
+
+  return files.map(file => {
+    let relative = path.relative(workspace, file)
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      relative = path.relative(rootDirectory, file)
+    }
+    const segments = relative.split(/[\\/]+/).filter(Boolean)
+    const name = segments.join('_')
+
+    if (isManifestName(name)) {
+      throw new Error(
+        `'${file}' would be uploaded as '${name}', which is reserved for upload manifests. No artifacts were uploaded.`
+      )
+    }
+    const existing = owners.get(name)
+    if (existing !== undefined) {
+      throw new Error(
+        `Artifact name collision: '${existing}' and '${file}' would both be uploaded as '${name}'. No artifacts were uploaded.`
+      )
+    }
+    owners.set(name, file)
+    return {artifact: name, path: segments.join('/')}
+  })
+}
+
+/**
+ * Without `overwrite`, fail up front if any target name is already taken in
+ * this run so we never leave a partial set of artifacts behind. Best effort:
+ * if listing fails, the upload itself still rejects duplicates.
+ */
+async function findExistingArtifacts(names: string[]): Promise<string[]> {
+  try {
+    const {artifacts} = await artifact.listArtifacts({latest: true})
+    const taken = new Set(artifacts.map(a => a.name))
+    return names.filter(n => taken.has(n))
+  } catch (error) {
+    core.debug(`Unable to list existing artifacts: ${(error as Error).message}`)
+    return []
+  }
+}
+
+/**
+ * Uploads a manifest artifact mapping each artifact name to its original
+ * relative path so download-artifact can restore the directory structure.
+ */
+async function uploadManifest(
+  manifestName: string,
+  entries: ManifestEntry[],
+  options: UploadArtifactOptions
+): Promise<void> {
+  const dir = await fs.mkdtemp(
+    path.join(process.env['RUNNER_TEMP'] || os.tmpdir(), 'upload-manifest-')
+  )
+  try {
+    const manifestFile = path.join(dir, manifestName)
+    await fs.writeFile(
+      manifestFile,
+      JSON.stringify({version: 1, files: entries}, null, 2)
+    )
+    await uploadArtifact(manifestName, [manifestFile], dir, options)
+  } finally {
+    await fs.rm(dir, {recursive: true, force: true})
   }
 }
 
@@ -57,18 +156,6 @@ export async function run(): Promise<void> {
     )
     core.debug(`Root artifact directory is ${searchResult.rootDirectory}`)
 
-    // Validate that only a single file is uploaded when archive is false
-    if (!inputs.archive && searchResult.filesToUpload.length > 1) {
-      core.setFailed(
-        `When 'archive' is set to false, only a single file can be uploaded. Found ${searchResult.filesToUpload.length} files to upload.`
-      )
-      return
-    }
-
-    if (inputs.overwrite) {
-      await deleteArtifactIfExists(inputs.artifactName)
-    }
-
     const options: UploadArtifactOptions = {}
     if (inputs.retentionDays) {
       options.retentionDays = inputs.retentionDays
@@ -76,6 +163,59 @@ export async function run(): Promise<void> {
 
     if (typeof inputs.compressionLevel !== 'undefined') {
       options.compressionLevel = inputs.compressionLevel
+    }
+
+    if (!inputs.archive && searchResult.filesToUpload.length > 1) {
+      // Each file becomes its own artifact; validate all names before uploading anything
+      const manifestName = getManifestName(inputs.artifactName)
+      let entries: ManifestEntry[]
+      try {
+        entries = getUnarchivedArtifactNames(
+          searchResult.filesToUpload,
+          searchResult.rootDirectory,
+          manifestName
+        )
+      } catch (error) {
+        core.setFailed((error as Error).message)
+        return
+      }
+
+      if (!inputs.overwrite) {
+        const taken = await findExistingArtifacts([
+          ...entries.map(e => e.artifact),
+          manifestName
+        ])
+        if (taken.length > 0) {
+          core.setFailed(
+            `Artifact(s) already exist in this run: ${taken.join(', ')}. No artifacts were uploaded. Set 'overwrite: true' to replace them.`
+          )
+          return
+        }
+      }
+
+      options.skipArchive = true
+      for (let i = 0; i < entries.length; i++) {
+        if (inputs.overwrite) {
+          await deleteArtifactIfExists(entries[i].artifact)
+        }
+        await uploadArtifact(
+          entries[i].artifact,
+          [searchResult.filesToUpload[i]],
+          searchResult.rootDirectory,
+          options
+        )
+      }
+
+      // Uploaded last so its presence implies every file above succeeded
+      if (inputs.overwrite) {
+        await deleteArtifactIfExists(manifestName)
+      }
+      await uploadManifest(manifestName, entries, options)
+      return
+    }
+
+    if (inputs.overwrite) {
+      await deleteArtifactIfExists(inputs.artifactName)
     }
 
     if (!inputs.archive) {

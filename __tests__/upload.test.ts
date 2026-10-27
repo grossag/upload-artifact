@@ -100,6 +100,10 @@ describe('upload', () => {
       rootDirectory: fixtures.rootDirectory
     })
 
+    jest.spyOn(artifact.default, 'listArtifacts').mockResolvedValue({
+      artifacts: []
+    })
+
     jest.spyOn(artifact.default, 'uploadArtifact').mockResolvedValue({
       size: 123,
       id: 1337,
@@ -315,15 +319,94 @@ describe('upload', () => {
     )
   })
 
-  test('fails when archive is false and multiple files are provided', async () => {
+  test('uploads each file separately when archive is false and multiple files are provided', async () => {
     mockInputs({
       [Inputs.Archive]: false
+    })
+    mockFindFilesToUpload.mockResolvedValue({
+      filesToUpload: [
+        '/some/artifact/path/file1.txt',
+        '/some/artifact/path/sub/file2.txt'
+      ],
+      rootDirectory: fixtures.rootDirectory
+    })
+
+    await run()
+
+    expect(core.setFailed).not.toHaveBeenCalled()
+    expect(artifact.default.uploadArtifact).toHaveBeenCalledTimes(3)
+    expect(artifact.default.uploadArtifact).toHaveBeenCalledWith(
+      '.artifact_upload_manifest.artifact-name.json',
+      [expect.stringContaining('.artifact_upload_manifest.artifact-name.json')],
+      expect.any(String),
+      {compressionLevel: 6, skipArchive: true}
+    )
+    expect(artifact.default.uploadArtifact).toHaveBeenCalledWith(
+      'file1.txt',
+      ['/some/artifact/path/file1.txt'],
+      fixtures.rootDirectory,
+      {compressionLevel: 6, skipArchive: true}
+    )
+    expect(artifact.default.uploadArtifact).toHaveBeenCalledWith(
+      'sub_file2.txt',
+      ['/some/artifact/path/sub/file2.txt'],
+      fixtures.rootDirectory,
+      {compressionLevel: 6, skipArchive: true}
+    )
+  })
+
+  test('fails without uploading when an artifact already exists in the run', async () => {
+    mockInputs({
+      [Inputs.Archive]: false
+    })
+    jest.spyOn(artifact.default, 'listArtifacts').mockResolvedValue({
+      artifacts: [{name: 'file1.txt'} as any]
     })
 
     await run()
 
     expect(core.setFailed).toHaveBeenCalledWith(
-      `When 'archive' is set to false, only a single file can be uploaded. Found ${fixtures.filesToUpload.length} files to upload.`
+      expect.stringContaining('already exist in this run: file1.txt')
+    )
+    expect(artifact.default.uploadArtifact).not.toHaveBeenCalled()
+  })
+
+  test('fails on files named like an upload manifest', async () => {
+    mockInputs({
+      [Inputs.Archive]: false
+    })
+    mockFindFilesToUpload.mockResolvedValue({
+      filesToUpload: [
+        '/some/artifact/path/file1.txt',
+        '/some/artifact/path/.artifact_upload_manifest.x.json'
+      ],
+      rootDirectory: fixtures.rootDirectory
+    })
+
+    await run()
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('reserved for upload manifests')
+    )
+    expect(artifact.default.uploadArtifact).not.toHaveBeenCalled()
+  })
+
+  test('fails without uploading when combined names collide', async () => {
+    mockInputs({
+      [Inputs.Archive]: false
+    })
+    mockFindFilesToUpload.mockResolvedValue({
+      filesToUpload: [
+        '/some/artifact/path/a_b.txt',
+        '/some/artifact/path/a/b.txt'
+      ],
+      rootDirectory: fixtures.rootDirectory
+    })
+
+    await run()
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining("would both be uploaded as 'a_b.txt'")
     )
     expect(artifact.default.uploadArtifact).not.toHaveBeenCalled()
   })

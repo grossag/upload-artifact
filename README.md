@@ -110,7 +110,11 @@ You are welcome to still raise bugs in this repo.
     include-hidden-files:
 
     # Whether to zip the artifact files before upload
-    # If 'false', only a single file can be uploaded. The name of the file will be used as the artifact name (the 'name' parameter is ignored)
+    # If 'false', files are uploaded as-is. A single file uses its own name as the artifact name (the 'name' parameter is ignored).
+    # Multiple files are each uploaded as a separate artifact named by joining the path segments with '_'
+    # (e.g. 'tests/folder1/a.txt' -> 'tests_folder1_a.txt'). The action fails without uploading if names collide.
+    # A '.artifact_upload_manifest.<name>.json' artifact is also uploaded so download-artifact can restore the original paths.
+    # Without 'overwrite', the action also fails up front if any of these artifact names already exist in the run.
     # Optional. Default is 'true'
     archive:
 ```
@@ -146,6 +150,18 @@ steps:
 - uses: actions/upload-artifact@v7
   with:
     path: path/to/artifact/world.txt
+    archive: false
+```
+
+### Upload Multiple Files or a Folder (Unzipped)
+
+With `archive: false`, each file is uploaded as its own artifact named by joining its path with `_`: `tests/folder1/a.txt` becomes `tests_folder1_a.txt`. Paths are relative to the workspace. If two files would get the same name, or an artifact with that name already exists in the run (without `overwrite`), the action fails before uploading anything. A `.artifact_upload_manifest.<name>.json` artifact is uploaded last so [download-artifact](https://github.com/actions/download-artifact) can restore the original paths.
+
+```yaml
+- uses: actions/upload-artifact@v7
+  with:
+    name: my-tests # names the manifest; the files are named by path
+    path: tests/
     archive: false
 ```
 

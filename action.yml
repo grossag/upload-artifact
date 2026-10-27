@@ -49,7 +49,8 @@ inputs:
     description: >
       If true, the artifact will be archived (zipped) before uploading.
       If false, the artifact will be uploaded as-is without archiving.
-      When `archive` is `false`, only a single file can be uploaded. The name of the file will be used as the artifact name (ignoring the `name` parameter).
+      When `archive` is `false` and a single file is uploaded, the name of the file will be used as the artifact name (ignoring the `name` parameter).
+      When multiple files are found, each is uploaded as its own artifact named by joining its path segments with `_` (e.g. `tests/folder1/a.txt` becomes `tests_folder1_a.txt`). The action fails without uploading anything if two files would get the same name. A `.artifact_upload_manifest.<name>.json` artifact is uploaded last, recording each file's original path so `download-artifact` can restore the directory structure.
     default: 'true'
 
 outputs:
