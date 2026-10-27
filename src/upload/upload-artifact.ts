@@ -98,6 +98,36 @@ async function findExistingArtifacts(names: string[]): Promise<string[]> {
 }
 
 /**
+ * With skipArchive the artifact client ignores the requested name and uses the
+ * file's basename, so stage the file under its combined name first. A hard link
+ * avoids copying large files; fall back to a copy across volumes.
+ */
+async function uploadRenamed(
+  artifactName: string,
+  file: string,
+  options: UploadArtifactOptions
+): Promise<void> {
+  const dir = await fs.mkdtemp(
+    path.join(process.env['RUNNER_TEMP'] || os.tmpdir(), 'upload-staging-')
+  )
+  try {
+    const staged = path.join(dir, artifactName)
+    try {
+      await fs.link(file, staged)
+      core.debug(`Hard-linked '${file}' as '${staged}'`)
+    } catch (error) {
+      core.debug(
+        `Unable to hard-link '${file}' (${(error as Error).message}); copying instead`
+      )
+      await fs.copyFile(file, staged)
+    }
+    await uploadArtifact(artifactName, [staged], dir, options)
+  } finally {
+    await fs.rm(dir, {recursive: true, force: true})
+  }
+}
+
+/**
  * Uploads a manifest artifact mapping each artifact name to its original
  * relative path so download-artifact can restore the directory structure.
  */
@@ -186,6 +216,9 @@ export async function run(): Promise<void> {
           manifestName
         ])
         if (taken.length > 0) {
+          core.error(
+            `These artifact names are already used in this run: ${taken.join(', ')}`
+          )
           core.setFailed(
             `Artifact(s) already exist in this run: ${taken.join(', ')}. No artifacts were uploaded. Set 'overwrite: true' to replace them.`
           )
@@ -194,19 +227,25 @@ export async function run(): Promise<void> {
       }
 
       options.skipArchive = true
+      core.info(
+        `Uploading ${entries.length} files as separate artifacts, plus manifest '${manifestName}'`
+      )
       for (let i = 0; i < entries.length; i++) {
+        core.info(
+          `[${i + 1}/${entries.length}] ${entries[i].path} -> artifact '${entries[i].artifact}'`
+        )
         if (inputs.overwrite) {
           await deleteArtifactIfExists(entries[i].artifact)
         }
-        await uploadArtifact(
+        await uploadRenamed(
           entries[i].artifact,
-          [searchResult.filesToUpload[i]],
-          searchResult.rootDirectory,
+          searchResult.filesToUpload[i],
           options
         )
       }
 
       // Uploaded last so its presence implies every file above succeeded
+      core.info(`Uploading manifest '${manifestName}'`)
       if (inputs.overwrite) {
         await deleteArtifactIfExists(manifestName)
       }

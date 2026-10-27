@@ -130675,6 +130675,29 @@ async function findExistingArtifacts(names) {
     }
 }
 /**
+ * With skipArchive the artifact client ignores the requested name and uses the
+ * file's basename, so stage the file under its combined name first. A hard link
+ * avoids copying large files; fall back to a copy across volumes.
+ */
+async function uploadRenamed(artifactName, file, options) {
+    const dir = await promises_namespaceObject.mkdtemp(external_path_.join(process.env['RUNNER_TEMP'] || external_os_.tmpdir(), 'upload-staging-'));
+    try {
+        const staged = external_path_.join(dir, artifactName);
+        try {
+            await promises_namespaceObject.link(file, staged);
+            core_debug(`Hard-linked '${file}' as '${staged}'`);
+        }
+        catch (error) {
+            core_debug(`Unable to hard-link '${file}' (${error.message}); copying instead`);
+            await promises_namespaceObject.copyFile(file, staged);
+        }
+        await upload_artifact_uploadArtifact(artifactName, [staged], dir, options);
+    }
+    finally {
+        await promises_namespaceObject.rm(dir, { recursive: true, force: true });
+    }
+}
+/**
  * Uploads a manifest artifact mapping each artifact name to its original
  * relative path so download-artifact can restore the directory structure.
  */
@@ -130737,18 +130760,22 @@ async function run() {
                     manifestName
                 ]);
                 if (taken.length > 0) {
+                    core_error(`These artifact names are already used in this run: ${taken.join(', ')}`);
                     setFailed(`Artifact(s) already exist in this run: ${taken.join(', ')}. No artifacts were uploaded. Set 'overwrite: true' to replace them.`);
                     return;
                 }
             }
             options.skipArchive = true;
+            info(`Uploading ${entries.length} files as separate artifacts, plus manifest '${manifestName}'`);
             for (let i = 0; i < entries.length; i++) {
+                info(`[${i + 1}/${entries.length}] ${entries[i].path} -> artifact '${entries[i].artifact}'`);
                 if (inputs.overwrite) {
                     await deleteArtifactIfExists(entries[i].artifact);
                 }
-                await upload_artifact_uploadArtifact(entries[i].artifact, [searchResult.filesToUpload[i]], searchResult.rootDirectory, options);
+                await uploadRenamed(entries[i].artifact, searchResult.filesToUpload[i], options);
             }
             // Uploaded last so its presence implies every file above succeeded
+            info(`Uploading manifest '${manifestName}'`);
             if (inputs.overwrite) {
                 await deleteArtifactIfExists(manifestName);
             }

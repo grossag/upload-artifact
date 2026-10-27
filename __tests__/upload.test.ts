@@ -1,4 +1,7 @@
 import {jest, describe, test, expect, beforeEach} from '@jest/globals'
+import * as fs from 'fs/promises'
+import * as os from 'os'
+import * as path from 'path'
 
 // Mock @actions/github before importing modules that use it
 jest.unstable_mockModule('@actions/github', () => ({
@@ -319,40 +322,64 @@ describe('upload', () => {
     )
   })
 
-  test('uploads each file separately when archive is false and multiple files are provided', async () => {
-    mockInputs({
-      [Inputs.Archive]: false
-    })
-    mockFindFilesToUpload.mockResolvedValue({
-      filesToUpload: [
-        '/some/artifact/path/file1.txt',
-        '/some/artifact/path/sub/file2.txt'
-      ],
-      rootDirectory: fixtures.rootDirectory
-    })
+  test('uploads each file under its combined name when archive is false and multiple files are provided', async () => {
+    // skipArchive makes the artifact client name the artifact after the file's
+    // basename, so the staged file itself must carry the combined name
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ul-test-'))
+    const prevWorkspace = process.env['GITHUB_WORKSPACE']
+    process.env['GITHUB_WORKSPACE'] = root
+    try {
+      await fs.mkdir(path.join(root, 'sub'))
+      await fs.writeFile(path.join(root, 'file1.txt'), 'one')
+      await fs.writeFile(path.join(root, 'sub', 'file2.txt'), 'two')
+      mockInputs({[Inputs.Archive]: false})
+      mockFindFilesToUpload.mockResolvedValue({
+        filesToUpload: [
+          path.join(root, 'file1.txt'),
+          path.join(root, 'sub', 'file2.txt')
+        ],
+        rootDirectory: root
+      })
+      const uploaded: Record<string, string> = {}
+      jest
+        .spyOn(artifact.default, 'uploadArtifact')
+        .mockImplementation(async (name: string, files: string[]) => {
+          expect(files).toHaveLength(1)
+          expect(path.basename(files[0])).toBe(name)
+          uploaded[name] = await fs.readFile(files[0], 'utf8')
+          return {size: 1, id: 1, digest: 'd'}
+        })
 
-    await run()
+      await run()
 
-    expect(core.setFailed).not.toHaveBeenCalled()
-    expect(artifact.default.uploadArtifact).toHaveBeenCalledTimes(3)
-    expect(artifact.default.uploadArtifact).toHaveBeenCalledWith(
-      '.artifact_upload_manifest.artifact-name.json',
-      [expect.stringContaining('.artifact_upload_manifest.artifact-name.json')],
-      expect.any(String),
-      {compressionLevel: 6, skipArchive: true}
-    )
-    expect(artifact.default.uploadArtifact).toHaveBeenCalledWith(
-      'file1.txt',
-      ['/some/artifact/path/file1.txt'],
-      fixtures.rootDirectory,
-      {compressionLevel: 6, skipArchive: true}
-    )
-    expect(artifact.default.uploadArtifact).toHaveBeenCalledWith(
-      'sub_file2.txt',
-      ['/some/artifact/path/sub/file2.txt'],
-      fixtures.rootDirectory,
-      {compressionLevel: 6, skipArchive: true}
-    )
+      expect(core.setFailed).not.toHaveBeenCalled()
+      expect(Object.keys(uploaded)).toEqual([
+        'file1.txt',
+        'sub_file2.txt',
+        '.artifact_upload_manifest.artifact-name.json'
+      ])
+      expect(uploaded['sub_file2.txt']).toBe('two')
+      expect(
+        JSON.parse(uploaded['.artifact_upload_manifest.artifact-name.json'])
+      ).toEqual({
+        version: 1,
+        files: [
+          {artifact: 'file1.txt', path: 'file1.txt'},
+          {artifact: 'sub_file2.txt', path: 'sub/file2.txt'}
+        ]
+      })
+      // The original files are left alone
+      expect(await fs.readFile(path.join(root, 'file1.txt'), 'utf8')).toBe(
+        'one'
+      )
+    } finally {
+      if (prevWorkspace === undefined) {
+        delete process.env['GITHUB_WORKSPACE']
+      } else {
+        process.env['GITHUB_WORKSPACE'] = prevWorkspace
+      }
+      await fs.rm(root, {recursive: true, force: true})
+    }
   })
 
   test('fails without uploading when an artifact already exists in the run', async () => {
