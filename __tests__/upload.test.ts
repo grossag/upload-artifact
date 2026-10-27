@@ -418,6 +418,26 @@ describe('upload', () => {
     expect(artifact.default.uploadArtifact).not.toHaveBeenCalled()
   })
 
+  test('fails without uploading when a combined name has an invalid character', async () => {
+    mockInputs({
+      [Inputs.Archive]: false
+    })
+    mockFindFilesToUpload.mockResolvedValue({
+      filesToUpload: [
+        '/some/artifact/path/file1.txt',
+        '/some/artifact/path/logs/10:00.txt'
+      ],
+      rootDirectory: fixtures.rootDirectory
+    })
+
+    await run()
+
+    expect(core.setFailed).toHaveBeenCalledWith(
+      expect.stringContaining('not allowed in artifact names')
+    )
+    expect(artifact.default.uploadArtifact).not.toHaveBeenCalled()
+  })
+
   test('fails without uploading when combined names collide', async () => {
     mockInputs({
       [Inputs.Archive]: false

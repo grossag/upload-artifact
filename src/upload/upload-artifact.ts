@@ -27,6 +27,23 @@ export interface ManifestEntry {
   path: string
 }
 
+// Mirrors the rules in @actions/artifact so bad names fail before any upload
+const INVALID_NAME_CHARS = [
+  '"',
+  ':',
+  '<',
+  '>',
+  '|',
+  '*',
+  '?',
+  '\r',
+  '\n',
+  '\\',
+  '/'
+]
+// The name is also used as a file name when staged for upload
+const MAX_NAME_BYTES = 255
+
 async function deleteArtifactIfExists(artifactName: string): Promise<void> {
   try {
     await artifact.deleteArtifact(artifactName)
@@ -65,6 +82,17 @@ export function getUnarchivedArtifactNames(
     const segments = relative.split(/[\\/]+/).filter(Boolean)
     const name = segments.join('_')
 
+    const badChar = INVALID_NAME_CHARS.find(c => name.includes(c))
+    if (badChar !== undefined) {
+      throw new Error(
+        `'${file}' would be uploaded as '${name}', which contains the character ${JSON.stringify(badChar)} that is not allowed in artifact names. No artifacts were uploaded.`
+      )
+    }
+    if (Buffer.byteLength(name) > MAX_NAME_BYTES) {
+      throw new Error(
+        `'${file}' would be uploaded as '${name}', which exceeds ${MAX_NAME_BYTES} bytes. No artifacts were uploaded.`
+      )
+    }
     if (isManifestName(name)) {
       throw new Error(
         `'${file}' would be uploaded as '${name}', which is reserved for upload manifests. No artifacts were uploaded.`
@@ -112,14 +140,16 @@ async function uploadRenamed(
   )
   try {
     const staged = path.join(dir, artifactName)
+    // link(2) does not dereference symlinks, so stage the real file
+    const source = await fs.realpath(file)
     try {
-      await fs.link(file, staged)
-      core.debug(`Hard-linked '${file}' as '${staged}'`)
+      await fs.link(source, staged)
+      core.debug(`Hard-linked '${source}' as '${staged}'`)
     } catch (error) {
       core.debug(
-        `Unable to hard-link '${file}' (${(error as Error).message}); copying instead`
+        `Unable to hard-link '${source}' (${(error as Error).message}); copying instead`
       )
-      await fs.copyFile(file, staged)
+      await fs.copyFile(source, staged)
     }
     await uploadArtifact(artifactName, [staged], dir, options)
   } finally {

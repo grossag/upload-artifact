@@ -130618,6 +130618,22 @@ const getManifestName = (groupName) => `${MANIFEST_PREFIX}${groupName}${MANIFEST
 const isManifestName = (name) => name.startsWith(MANIFEST_PREFIX) &&
     name.endsWith(MANIFEST_SUFFIX) &&
     name.length > MANIFEST_PREFIX.length + MANIFEST_SUFFIX.length;
+// Mirrors the rules in @actions/artifact so bad names fail before any upload
+const INVALID_NAME_CHARS = [
+    '"',
+    ':',
+    '<',
+    '>',
+    '|',
+    '*',
+    '?',
+    '\r',
+    '\n',
+    '\\',
+    '/'
+];
+// The name is also used as a file name when staged for upload
+const MAX_NAME_BYTES = 255;
 async function deleteArtifactIfExists(artifactName) {
     try {
         await artifact.deleteArtifact(artifactName);
@@ -130647,6 +130663,13 @@ function getUnarchivedArtifactNames(files, rootDirectory, manifestName) {
         }
         const segments = relative.split(/[\\/]+/).filter(Boolean);
         const name = segments.join('_');
+        const badChar = INVALID_NAME_CHARS.find(c => name.includes(c));
+        if (badChar !== undefined) {
+            throw new Error(`'${file}' would be uploaded as '${name}', which contains the character ${JSON.stringify(badChar)} that is not allowed in artifact names. No artifacts were uploaded.`);
+        }
+        if (Buffer.byteLength(name) > MAX_NAME_BYTES) {
+            throw new Error(`'${file}' would be uploaded as '${name}', which exceeds ${MAX_NAME_BYTES} bytes. No artifacts were uploaded.`);
+        }
         if (isManifestName(name)) {
             throw new Error(`'${file}' would be uploaded as '${name}', which is reserved for upload manifests. No artifacts were uploaded.`);
         }
@@ -130683,13 +130706,15 @@ async function uploadRenamed(artifactName, file, options) {
     const dir = await promises_namespaceObject.mkdtemp(external_path_.join(process.env['RUNNER_TEMP'] || external_os_.tmpdir(), 'upload-staging-'));
     try {
         const staged = external_path_.join(dir, artifactName);
+        // link(2) does not dereference symlinks, so stage the real file
+        const source = await promises_namespaceObject.realpath(file);
         try {
-            await promises_namespaceObject.link(file, staged);
-            core_debug(`Hard-linked '${file}' as '${staged}'`);
+            await promises_namespaceObject.link(source, staged);
+            core_debug(`Hard-linked '${source}' as '${staged}'`);
         }
         catch (error) {
-            core_debug(`Unable to hard-link '${file}' (${error.message}); copying instead`);
-            await promises_namespaceObject.copyFile(file, staged);
+            core_debug(`Unable to hard-link '${source}' (${error.message}); copying instead`);
+            await promises_namespaceObject.copyFile(source, staged);
         }
         await upload_artifact_uploadArtifact(artifactName, [staged], dir, options);
     }
